@@ -89,30 +89,6 @@ impl Pasteboard {
         None
     }
 
-    fn read_external_paths(&self) -> Option<ClipboardItem> {
-        unsafe {
-            let filenames = NSPasteboard::propertyListForType(self.inner, NSFilenamesPboardType);
-            if filenames == nil {
-                return None;
-            }
-            let mut paths: SmallVec<[PathBuf; 2]> = SmallVec::new();
-            for file in filenames.iter() {
-                let ptr = NSString::UTF8String(file);
-                if ptr.is_null() {
-                    continue;
-                }
-                let path = CStr::from_ptr(ptr).to_string_lossy().into_owned();
-                paths.push(PathBuf::from(path));
-            }
-            if paths.is_empty() {
-                return None;
-            }
-            Some(ClipboardItem {
-                entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(paths))],
-            })
-        }
-    }
-
     fn read_image(&self, format: ImageFormat) -> Option<ClipboardItem> {
         let ut_type: UTType = format.into();
 
