@@ -12,7 +12,7 @@ use cloud_llm_client::{
 };
 use collections::{HashMap, HashSet};
 use copilot::{Copilot, Reinstall, SignIn, SignOut};
-use db::kvp::{Dismissable, KEY_VALUE_STORE};
+use db::kvp::{Dismissable, KeyValueStore};
 use edit_prediction_context::{RelatedExcerptStore, RelatedExcerptStoreEvent, RelatedFile};
 use feature_flags::{FeatureFlag, FeatureFlagAppExt as _};
 use futures::{
@@ -385,6 +385,7 @@ impl ProjectState {
                         EditPredictionRejectReason::Canceled,
                         false,
                         None,
+                        None,
                         cx,
                     );
                 })
@@ -413,6 +414,7 @@ struct CurrentEditPrediction {
     pub prediction: EditPrediction,
     pub was_shown: bool,
     pub shown_with: Option<edit_prediction_types::SuggestionDisplayType>,
+    pub e2e_latency: std::time::Duration,
 }
 
 impl CurrentEditPrediction {
@@ -506,12 +508,14 @@ impl std::ops::Deref for BufferEditPrediction<'_> {
 }
 
 #[derive(Clone)]
+
 struct PendingSettledPrediction {
     request_id: EditPredictionId,
     editable_anchor_range: Range<Anchor>,
     example: Option<ExampleSpec>,
     enqueued_at: Instant,
     last_edit_at: Instant,
+    e2e_latency: std::time::Duration,
 }
 
 struct RegisteredBuffer {
@@ -766,7 +770,7 @@ impl EditPredictionStore {
     }
 
     pub fn new(client: Arc<Client>, user_store: Entity<UserStore>, cx: &mut Context<Self>) -> Self {
-        let data_collection_choice = Self::load_data_collection_choice();
+        let data_collection_choice = Self::load_data_collection_choice(cx);
 
         let llm_token = LlmApiToken::global(cx);
 
@@ -1686,6 +1690,7 @@ impl EditPredictionStore {
                                         request_id = pending_prediction.request_id.0.clone(),
                                         settled_editable_region,
                                         example = pending_prediction.example.take(),
+                                        e2e_latency = pending_prediction.e2e_latency.as_millis(),
                                     );
 
                                     return false;
@@ -1715,6 +1720,7 @@ impl EditPredictionStore {
         edited_buffer_snapshot: &BufferSnapshot,
         editable_offset_range: Range<usize>,
         example: Option<ExampleSpec>,
+        e2e_latency: std::time::Duration,
         cx: &mut Context<Self>,
     ) {
         let this = &mut *self;
@@ -1729,6 +1735,7 @@ impl EditPredictionStore {
                 editable_anchor_range: edited_buffer_snapshot
                     .anchor_range_around(editable_offset_range),
                 example,
+                e2e_latency,
                 enqueued_at: now,
                 last_edit_at: now,
             });
@@ -1751,6 +1758,7 @@ impl EditPredictionStore {
                     reason,
                     prediction.was_shown,
                     model_version,
+                    Some(prediction.e2e_latency),
                     cx,
                 );
             }
@@ -1812,6 +1820,7 @@ impl EditPredictionStore {
         reason: EditPredictionRejectReason,
         was_shown: bool,
         model_version: Option<String>,
+        e2e_latency: Option<std::time::Duration>,
         cx: &App,
     ) {
         match self.edit_prediction_model {
@@ -1835,6 +1844,7 @@ impl EditPredictionStore {
                                 reason,
                                 was_shown,
                                 model_version,
+                                e2e_latency_ms: e2e_latency.map(|latency| latency.as_millis()),
                             },
                             organization_id,
                         })
@@ -2008,6 +2018,7 @@ impl EditPredictionStore {
                                 EditPredictionResult {
                                     id: prediction_result.id,
                                     prediction: Err(EditPredictionRejectReason::CurrentPreferred),
+                                    e2e_latency: prediction_result.e2e_latency,
                                 }
                             },
                             PredictionRequestedBy::DiagnosticsUpdate,
@@ -2140,11 +2151,12 @@ impl EditPredictionStore {
                     let project_state = this.get_or_init_project(&project, cx);
                     let throttle = *select_throttle(project_state, request_trigger);
 
+                    let now = cx.background_executor().now();
                     throttle.and_then(|(last_entity, last_timestamp)| {
                         if throttle_entity != last_entity {
                             return None;
                         }
-                        (last_timestamp + throttle_timeout).checked_duration_since(Instant::now())
+                        (last_timestamp + throttle_timeout).checked_duration_since(now)
                     })
                 })
                 .ok()
@@ -2172,7 +2184,7 @@ impl EditPredictionStore {
                     return;
                 }
 
-                let new_refresh = (throttle_entity, Instant::now());
+                let new_refresh = (throttle_entity, cx.background_executor().now());
                 *select_throttle(project_state, request_trigger) = Some(new_refresh);
                 is_cancelled = false;
             })
@@ -2205,6 +2217,7 @@ impl EditPredictionStore {
                                 prediction,
                                 was_shown: false,
                                 shown_with: None,
+                                e2e_latency: prediction_result.e2e_latency,
                             };
 
                             if let Some(current_prediction) =
@@ -2225,6 +2238,7 @@ impl EditPredictionStore {
                                         EditPredictionRejectReason::CurrentPreferred,
                                         false,
                                         new_prediction.prediction.model_version,
+                                        Some(new_prediction.e2e_latency),
                                         cx,
                                     );
                                     None
@@ -2239,6 +2253,7 @@ impl EditPredictionStore {
                                 reject_reason,
                                 false,
                                 None,
+                                Some(prediction_result.e2e_latency),
                                 cx,
                             );
                             None
@@ -2731,8 +2746,8 @@ impl EditPredictionStore {
         self.data_collection_choice.is_enabled(cx)
     }
 
-    fn load_data_collection_choice() -> DataCollectionChoice {
-        let choice = KEY_VALUE_STORE
+    fn load_data_collection_choice(cx: &App) -> DataCollectionChoice {
+        let choice = KeyValueStore::global(cx)
             .read_kvp(ZED_PREDICT_DATA_COLLECTION_CHOICE)
             .log_err()
             .flatten();
@@ -2752,11 +2767,13 @@ impl EditPredictionStore {
         self.data_collection_choice = self.data_collection_choice.toggle();
         let new_choice = self.data_collection_choice;
         let is_enabled = new_choice.is_enabled(cx);
-        db::write_and_log(cx, move || {
-            KEY_VALUE_STORE.write_kvp(
+        let kvp = KeyValueStore::global(cx);
+        db::write_and_log(cx, move || async move {
+            kvp.write_kvp(
                 ZED_PREDICT_DATA_COLLECTION_CHOICE.into(),
                 is_enabled.to_string(),
             )
+            .await
         });
     }
 
@@ -2992,12 +3009,13 @@ struct ZedPredictUpsell;
 impl Dismissable for ZedPredictUpsell {
     const KEY: &'static str = "dismissed-edit-predict-upsell";
 
-    fn dismissed() -> bool {
+    fn dismissed(cx: &App) -> bool {
         // To make this backwards compatible with older versions of Zed, we
         // check if the user has seen the previous Edit Prediction Onboarding
         // before, by checking the data collection choice which was written to
         // the database once the user clicked on "Accept and Enable"
-        if KEY_VALUE_STORE
+        let kvp = KeyValueStore::global(cx);
+        if kvp
             .read_kvp(ZED_PREDICT_DATA_COLLECTION_CHOICE)
             .log_err()
             .is_some_and(|s| s.is_some())
@@ -3005,15 +3023,14 @@ impl Dismissable for ZedPredictUpsell {
             return true;
         }
 
-        KEY_VALUE_STORE
-            .read_kvp(Self::KEY)
+        kvp.read_kvp(Self::KEY)
             .log_err()
             .is_some_and(|s| s.is_some())
     }
 }
 
-pub fn should_show_upsell_modal() -> bool {
-    !ZedPredictUpsell::dismissed()
+pub fn should_show_upsell_modal(cx: &App) -> bool {
+    !ZedPredictUpsell::dismissed(cx)
 }
 
 pub fn init(cx: &mut App) {
