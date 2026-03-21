@@ -860,9 +860,7 @@ pub(crate) fn paste_images_as_context(
         let (mut images, paths): (Vec<(gpui::Image, SharedString)>, Vec<_>) = clipboard
             .into_entries()
             .filter_map(|entry| match entry {
-                ClipboardEntry::Image(image) => {
-                    Some(Either::Left((image, default_name.clone())))
-                }
+                ClipboardEntry::Image(image) => Some(Either::Left((image, default_name.clone()))),
                 ClipboardEntry::ExternalPaths(paths) => Some(Either::Right(paths)),
                 _ => None,
             })
